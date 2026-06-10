@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+mcp/venv/
+mcp/.venv/
+*.egg-info/
+
+# Environment / secrets
+/etc/
+*.env
+!*.env.example
+
+# Logs
+*.log
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db

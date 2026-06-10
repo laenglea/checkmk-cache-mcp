@@ -1,0 +1,46 @@
+# /etc/systemd/system/checkmk-cache-mcp.service
+#
+# MCP server — exposes CheckMK cache data via HTTP/SSE.
+# Enable with:  systemctl enable --now checkmk-cache-mcp
+
+[Unit]
+Description=CheckMK Cache MCP Server
+Documentation=https://github.com/yourorg/checkmk-cache-mcp
+After=network.target
+
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+EnvironmentFile=/etc/sysconfig/checkmk-cache-mcp
+
+User=cmkcache
+Group=cmkcache
+
+ExecStart=/opt/checkmk-cache-mcp/mcp/venv/bin/python \
+          /opt/checkmk-cache-mcp/mcp/checkmk_cache_mcp.py
+
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=checkmk-cache-mcp
+
+# Read-only access to cache and history directories
+# (adjust paths to match CHECKMK_CACHE_DIR / CHECKMK_HISTORY_DIR)
+ReadOnlyPaths=/omd /cachehistory
+
+# Harden the service
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

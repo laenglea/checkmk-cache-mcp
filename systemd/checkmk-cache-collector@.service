@@ -1,0 +1,53 @@
+# /etc/systemd/system/checkmk-cache-collector@.service
+#
+# Instantiated service — one instance per CheckMK site.
+# Enable with:  systemctl enable --now checkmk-cache-collector@mysite
+#
+# The instance name (%i) must match the suffix of the EnvironmentFile:
+#   /etc/sysconfig/sync_checkmk_cache_%i
+
+[Unit]
+Description=CheckMK Cache Collector (%i)
+Documentation=https://github.com/yourorg/checkmk-cache-mcp
+After=network.target
+
+# Restart automatically if inotifywait or the script exits unexpectedly
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+[Service]
+Type=simple
+
+# Load site-specific configuration
+EnvironmentFile=/etc/sysconfig/sync_checkmk_cache_%i
+
+# Run as a dedicated non-root user (create with: useradd -r -s /sbin/nologin cmkcache)
+# The user needs read access to SOURCE_DIR and write access to DEST_DIR / LOCKDIR.
+User=cmkcache
+Group=cmkcache
+
+# Allow the script to raise inotify queue limits via sysctl
+# (alternatively, set fs.inotify.max_queued_events=131072 in /etc/sysctl.d/)
+AmbientCapabilities=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN
+
+ExecStart=/opt/checkmk-cache-mcp/collector/sync_checkmk_cache.sh
+
+# Graceful stop: sends SIGTERM, script drains queue then exits
+KillSignal=SIGTERM
+TimeoutStopSec=60
+
+Restart=on-failure
+RestartSec=10
+
+# Logging via journald (also written to LOGFILE inside the script)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=cmkcache-%i
+
+# Runtime directory for lock files (maps to /run/checkmk-cache-collector/%i)
+RuntimeDirectory=checkmk-cache-collector/%i
+RuntimeDirectoryMode=0750
+
+[Install]
+WantedBy=multi-user.target
