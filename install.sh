@@ -43,6 +43,14 @@ if ! id "$SERVICE_USER" &>/dev/null; then
     useradd -r -s /sbin/nologin -d /var/lib/cmkcache -m "$SERVICE_USER"
 fi
 
+if getent group "$SITE" &>/dev/null; then
+    info "Adding $SERVICE_USER to group '$SITE' (CheckMK cache access)..."
+    usermod -aG "$SITE" "$SERVICE_USER"
+else
+    warn "Group '$SITE' not found — skipping group membership."
+    warn "Once CheckMK is installed, run: usermod -aG $SITE $SERVICE_USER"
+fi
+
 # ── Install files ─────────────────────────────────────────────────────────────
 info "Installing to $INSTALL_DIR ..."
 mkdir -p "$INSTALL_DIR/collector" "$INSTALL_DIR/mcp"

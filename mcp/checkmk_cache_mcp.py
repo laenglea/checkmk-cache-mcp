@@ -14,6 +14,7 @@ Configuration (env vars):
   MCP_API_KEY          Default: "" (no auth)
 """
 from __future__ import annotations
+import fnmatch
 import hmac
 import json
 import os
@@ -243,9 +244,9 @@ def parse_processes_linux(ps_text: str, filter_user: str = None,
         if len(parts) < 8:
             continue
         _, user, vsz, rss, cpu_time, elapsed, pid, cmd = parts
-        if filter_user and filter_user.lower() not in user.lower():
+        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower()):
             continue
-        if filter_cmd and filter_cmd.lower() not in cmd.lower():
+        if filter_cmd and not fnmatch.fnmatch(cmd.lower(), f"*{filter_cmd.lower()}*" if "*" not in filter_cmd else filter_cmd.lower()):
             continue
         if filter_regex and not filter_regex.search(cmd):
             continue
@@ -290,7 +291,7 @@ def parse_processes_windows(ps_text: str,
         if len(parts) < 2:
             continue
         meta, name = parts[0], parts[1].strip()
-        if filter_cmd and filter_cmd.lower() not in name.lower():
+        if filter_cmd and not fnmatch.fnmatch(name.lower(), f"*{filter_cmd.lower()}*" if "*" not in filter_cmd else filter_cmd.lower()):
             continue
         if filter_regex and not filter_regex.search(name):
             continue
@@ -298,7 +299,7 @@ def parse_processes_windows(ps_text: str,
         if not m:
             continue
         user = m.group(1)
-        if filter_user and filter_user.lower() not in user.lower():
+        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower()):
             continue
         procs.append({
             "name":         name,
@@ -603,7 +604,6 @@ def tool_list_hosts(pattern: str = None) -> str:
         return f"Cache directory not found: {BASE_DIR}"
     hosts = sorted(p.name for p in BASE_DIR.iterdir() if p.is_file())
     if pattern:
-        import fnmatch
         hosts = [h for h in hosts if fnmatch.fnmatch(h.lower(), pattern.lower())]
     if not hosts:
         return (f"No hosts matching '{pattern}' in {BASE_DIR}"
@@ -908,9 +908,9 @@ TOOLS = [
             "Process list, sorted and limited server-side. Automatically detects Windows or Linux. "
             "Windows sort_by: rss (resident/working-set, default), vsz (virtual), cpu, pagefile, name, handles, threads. "
             "Linux sort_by: rss (default), vsz, cpu_time, elapsed, cmd. "
-            "filter_cmd: case-insensitive substring. "
+            "filter_cmd: case-insensitive substring or glob (e.g. 'java', 'java*', '*agent*'). "
             "filter_regex: Python regex on command/process name. "
-            "filter_user: case-insensitive substring on username. "
+            "filter_user: case-insensitive glob on username (e.g. 'oracle', 'svc_*', '*'). "
             "aggregate=true (Windows only): groups multiple instances of the same process name."
         ),
         "inputSchema": {
