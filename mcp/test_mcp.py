@@ -129,7 +129,7 @@ def run(url: str, api_key: str, history_at: str):
     t("get_processes linux sort vsz",      "get_processes", {"host": LINUX_HOST, "sort_by": "vsz", "limit": 5})
     t("get_processes linux filter_user *", "get_processes", {"host": LINUX_HOST, "filter_user": "*"})
     t("get_processes linux aggregate warn","get_processes", {"host": LINUX_HOST, "aggregate": True},
-      warn_if="aggregate ignored")
+      expect="aggregate ignored")
 
     # ── get_section ─────────────────────────────────────────────────────────
     print("\n── get_section ────────────────────────────────────────────────")
