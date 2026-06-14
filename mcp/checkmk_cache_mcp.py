@@ -35,6 +35,9 @@ MCP_HOST     = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT     = int(os.environ.get("MCP_PORT", "8765"))
 API_KEY      = os.environ.get("MCP_API_KEY", "")
 
+_ZSTD_AVAILABLE = bool(subprocess.run(["which", "zstd"], capture_output=True).returncode == 0)
+_archive_errors: list[str] = []
+
 SECTION_ALIASES: dict[str, list[str]] = {
     # Linux
     "ps":       ["ps_lnx"],
@@ -148,15 +151,17 @@ def _read_files_from_dir(bucket: Path, host: str,
 def _read_files_from_archive(archive: Path, host: str,
                               start: datetime, end: datetime) -> list[tuple[datetime, str]]:
     results = []
+    proc = None
     try:
         if archive.name.endswith(".tar.zst"):
+            if not _ZSTD_AVAILABLE:
+                raise RuntimeError("zstd binary not found — install zstd to read .tar.zst archives")
             proc = subprocess.Popen(
                 ["zstd", "-d", "-c", str(archive)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
             tf = tarfile.open(fileobj=proc.stdout, mode="r|")
         else:
-            proc = None
             tf = tarfile.open(archive, "r:*")
         with tf:
             for member in tf:
@@ -173,8 +178,8 @@ def _read_files_from_archive(archive: Path, host: str,
                     results.append((ts, f.read().decode(errors="replace")))
         if proc:
             proc.wait()
-    except Exception:
-        pass
+    except Exception as e:
+        _archive_errors.append(f"{archive.name}: {e}")
     return results
 
 
@@ -244,9 +249,9 @@ def parse_processes_linux(ps_text: str, filter_user: str = None,
         if len(parts) < 8:
             continue
         _, user, vsz, rss, cpu_time, elapsed, pid, cmd = parts
-        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower()):
+        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower() if "*" in filter_user else f"*{filter_user.lower()}*"):
             continue
-        if filter_cmd and not fnmatch.fnmatch(cmd.lower(), f"*{filter_cmd.lower()}*" if "*" not in filter_cmd else filter_cmd.lower()):
+        if filter_cmd and not fnmatch.fnmatch(cmd.lower(), filter_cmd.lower() if "*" in filter_cmd else f"*{filter_cmd.lower()}*"):
             continue
         if filter_regex and not filter_regex.search(cmd):
             continue
@@ -291,7 +296,7 @@ def parse_processes_windows(ps_text: str,
         if len(parts) < 2:
             continue
         meta, name = parts[0], parts[1].strip()
-        if filter_cmd and not fnmatch.fnmatch(name.lower(), f"*{filter_cmd.lower()}*" if "*" not in filter_cmd else filter_cmd.lower()):
+        if filter_cmd and not fnmatch.fnmatch(name.lower(), filter_cmd.lower() if "*" in filter_cmd else f"*{filter_cmd.lower()}*"):
             continue
         if filter_regex and not filter_regex.search(name):
             continue
@@ -299,7 +304,7 @@ def parse_processes_windows(ps_text: str,
         if not m:
             continue
         user = m.group(1)
-        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower()):
+        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower() if "*" in filter_user else f"*{filter_user.lower()}*"):
             continue
         procs.append({
             "name":         name,
@@ -1107,12 +1112,15 @@ async def mcp_endpoint(request: Request):
 @app.get("/health")
 async def health():
     hosts = sorted(p.name for p in BASE_DIR.iterdir() if p.is_file()) if BASE_DIR.exists() else []
+    recent_errors = _archive_errors[-10:] if _archive_errors else []
     return {
-        "status": "ok",
+        "status": "degraded" if recent_errors else "ok",
         "cache_dir": str(BASE_DIR),
         "history_dir": str(HISTORY_DIR) if HISTORY_DIR else None,
+        "zstd_available": _ZSTD_AVAILABLE,
         "host_count": len(hosts),
         "hosts": hosts,
+        "recent_archive_errors": recent_errors,
     }
 
 
