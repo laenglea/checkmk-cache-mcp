@@ -674,7 +674,8 @@ def tool_get_processes(host: str, sort_by: str = "rss", limit: int = 15,
         sort_key = _SORT_KEY_LNX.get(sort_by, "rss_kb")
         procs.sort(key=lambda p: p[sort_key], reverse=sort_key not in ("cmd",))
         header = (f"Host: {host}  OS: linux  total={len(procs)}"
-                  f"  sort={sort_by}  showing={min(limit, len(procs))}")
+                  f"  sort={sort_by}  showing={min(limit, len(procs))}"
+                  + ("  [note: aggregate ignored on Linux]" if aggregate else ""))
         return header + "\n" + _format_procs_linux(procs, limit)
 
 
@@ -880,7 +881,6 @@ def tool_get_history_processes(host: str, at: str, sort_by: str = "rss",
         header = (f"Host: {host}  OS: windows  snapshot: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                   f"  total={len(procs)}  sort={sort_by}  showing={min(limit, len(procs))}"
                   f"{'  [aggregated]' if aggregate else ''}")
-        # FIX: aggregate-Parameter wird jetzt korrekt weitergegeben
         return header + "\n" + _format_procs_windows(procs, limit, aggregate)
     else:
         ps_raw = parse_section(content, "ps_lnx") or ""
@@ -892,7 +892,8 @@ def tool_get_history_processes(host: str, at: str, sort_by: str = "rss",
         sort_key = _SORT_KEY_LNX.get(sort_by, "rss_kb")
         procs.sort(key=lambda p: p[sort_key], reverse=sort_key not in ("cmd",))
         header = (f"Host: {host}  OS: linux  snapshot: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-                  f"  total={len(procs)}  sort={sort_by}  showing={min(limit, len(procs))}")
+                  f"  total={len(procs)}  sort={sort_by}  showing={min(limit, len(procs))}"
+                  + ("  [note: aggregate ignored on Linux]" if aggregate else ""))
         return header + "\n" + _format_procs_linux(procs, limit)
 
 
@@ -945,7 +946,9 @@ _HISTORY_TOOLS = [
             "Automatically detects Windows or Linux. "
             "Windows sort_by: rss (resident/working-set), vsz (virtual), cpu, pagefile, name, handles, threads. "
             "Linux sort_by: rss, vsz, cpu_time, elapsed, cmd. "
-            "aggregate=true groups multiple instances of the same Windows process name."
+            "filter_cmd OR filter_regex (not both — AND logic). "
+            "aggregate=true (Windows only, ignored on Linux): groups multiple instances of the same process name. "
+            "window_minutes: search radius around 'at' to find the nearest snapshot (default 10)."
         ),
         "inputSchema": {
             "type": "object",
@@ -988,7 +991,7 @@ _HISTORY_TOOLS = [
             "metric: 'mem' (RAM used/total/%) or 'cpu' (load averages on Linux, processor queue on Windows). "
             "from/to: ISO-8601 range, e.g. '2026-06-14T14:00' / '2026-06-14T15:00'. "
             "samples: evenly distributed data points (default 10, max 50). "
-            "Does NOT support sort_by, limit, filter_cmd, or window_minutes — use get_history_processes for that."
+            "Does NOT support sort_by, limit, filter_cmd, filter_user, aggregate, or window_minutes — use get_history_processes for that."
         ),
         "inputSchema": {
             "type": "object",
@@ -1025,7 +1028,7 @@ TOOLS = [
         "name": "list_sections",
         "description": (
             "List all CheckMK sections present in the cached agent output for a host. "
-            "Use this to discover available data before calling get_section."
+            "Only call this if you are unsure which sections exist — skip it when the section name is already known."
         ),
         "inputSchema": {
             "type": "object",
@@ -1053,9 +1056,9 @@ TOOLS = [
             "Windows sort_by: rss (resident/working-set, default), vsz (virtual), cpu, pagefile, name, handles, threads. "
             "Linux sort_by: rss (default), vsz, cpu_time, elapsed, cmd. "
             "filter_cmd: case-insensitive substring or glob (e.g. 'java', 'java*', '*agent*'). "
-            "filter_regex: Python regex on command/process name. "
+            "filter_regex: Python regex on command/process name — use either filter_cmd OR filter_regex, not both (AND logic). "
             "filter_user: case-insensitive glob on username (e.g. 'oracle', 'svc_*', '*'). "
-            "aggregate=true (Windows only): groups multiple instances of the same process name."
+            "aggregate=true (Windows only, ignored on Linux): groups multiple instances of the same process name."
         ),
         "inputSchema": {
             "type": "object",
