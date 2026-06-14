@@ -14,6 +14,7 @@ Configuration (env vars):
   MCP_API_KEY          Default: "" (no auth)
 """
 from __future__ import annotations
+import hmac
 import json
 import os
 import re
@@ -597,13 +598,18 @@ def _overview_df(content: str, os_type: str) -> list[str]:
 
 # ── Tool implementations ────────────────────────────────────────────────────
 
-def tool_list_hosts() -> str:
+def tool_list_hosts(pattern: str = None) -> str:
     if not BASE_DIR.exists():
         return f"Cache directory not found: {BASE_DIR}"
     hosts = sorted(p.name for p in BASE_DIR.iterdir() if p.is_file())
+    if pattern:
+        import fnmatch
+        hosts = [h for h in hosts if fnmatch.fnmatch(h.lower(), pattern.lower())]
     if not hosts:
-        return f"No host files found in {BASE_DIR}"
-    lines = [f"Hosts in {BASE_DIR} ({len(hosts)}):"]
+        return (f"No hosts matching '{pattern}' in {BASE_DIR}"
+                if pattern else f"No host files found in {BASE_DIR}")
+    label = f"Hosts in {BASE_DIR} ({len(hosts)}" + (f", filter='{pattern}'" if pattern else "") + "):"
+    lines = [label]
     for h in hosts:
         lines.append(f"  {h:<40} {_cache_age(h)}")
     return "\n".join(lines)
@@ -665,6 +671,19 @@ def tool_get_processes(host: str, sort_by: str = "rss", limit: int = 15,
         header = (f"Host: {host}  OS: linux  total={len(procs)}"
                   f"  sort={sort_by}  showing={min(limit, len(procs))}")
         return header + "\n" + _format_procs_linux(procs, limit)
+
+
+def tool_list_sections(host: str) -> str:
+    content = _read_host(host)
+    if not content:
+        return f"Host '{host}' not found in {BASE_DIR}"
+    sections = re.findall(r"^<<<([^>]+)>>>", content, re.MULTILINE)
+    if not sections:
+        return f"No sections found for host '{host}'"
+    lines = [f"Sections for {host} ({len(sections)}):"]
+    for s in sections:
+        lines.append(f"  {s}")
+    return "\n".join(lines)
 
 
 def tool_get_section(host: str, section: str) -> str:
@@ -844,8 +863,31 @@ _HISTORY_TOOLS = [
 TOOLS = [
     {
         "name": "list_hosts",
-        "description": "List all available hosts in the cache directory with cache file age.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "description": (
+            "List available hosts in the cache directory with cache file age. "
+            "Supports glob pattern filtering, e.g. pattern='web*' or pattern='*prod*'. "
+            "Omit pattern to list all hosts."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string",
+                            "description": "Optional glob pattern (case-insensitive), e.g. 'web*', '*db*'"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_sections",
+        "description": (
+            "List all CheckMK sections present in the cached agent output for a host. "
+            "Use this to discover available data before calling get_section."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"host": {"type": "string"}},
+            "required": ["host"],
+        },
     },
     {
         "name": "get_overview",
@@ -913,7 +955,9 @@ if HISTORY_DIR:
 
 def dispatch(name: str, args: dict) -> str:
     if name == "list_hosts":
-        return tool_list_hosts()
+        return tool_list_hosts(args.get("pattern"))
+    if name == "list_sections":
+        return tool_list_sections(args["host"])
     if name == "get_overview":
         return tool_get_overview(args["host"])
     if name == "get_processes":
@@ -990,9 +1034,9 @@ def _check_auth(request: Request) -> bool:
     if not API_KEY:
         return True
     auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer ") and auth[7:] == API_KEY:
-        return True
-    return request.headers.get("x-api-key", "") == API_KEY
+    if auth.lower().startswith("bearer "):
+        return hmac.compare_digest(auth[7:], API_KEY)
+    return hmac.compare_digest(request.headers.get("x-api-key", ""), API_KEY)
 
 
 @app.api_route("/mcp", methods=["OPTIONS", "GET", "POST"])
@@ -1045,7 +1089,7 @@ async def mcp_endpoint(request: Request):
         except Exception as e:
             text = f"Error: {e}"
         result = {"content": [{"type": "text", "text": text}],
-                  "isError": text.startswith("Error")}
+                  "isError": isinstance(text, str) and re.match(r"^(Error|Unknown tool):", text) is not None}
     else:
         result = {"code": -32601, "message": f"Unknown method: {method}"}
 
@@ -1077,7 +1121,8 @@ if __name__ == "__main__":
     print("CheckMK Cache MCP  v2.1 (Windows+Linux)")
     print(f"  Cache:    {BASE_DIR}")
     print(f"  History:  {HISTORY_DIR or '(disabled — set CHECKMK_HISTORY_DIR to enable)'}")
-    print(f"  Tools:    {len(TOOLS)} ({4} current{f' + {n_hist} historical' if HISTORY_DIR else ''})")
+    n_current = len(TOOLS) - (n_hist if HISTORY_DIR else 0)
+    print(f"  Tools:    {len(TOOLS)} ({n_current} current{f' + {n_hist} historical' if HISTORY_DIR else ''})")
     print(f"  Endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
     print(f"  Health:   http://{MCP_HOST}:{MCP_PORT}/health")
     print(f"  API-Key:  {'(set)' if API_KEY else '(none — set MCP_API_KEY to enable auth)'}")
