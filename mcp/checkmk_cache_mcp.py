@@ -706,6 +706,124 @@ def tool_get_section(host: str, section: str) -> str:
     return "\n\n".join(parts)
 
 
+# ── History range helpers ─────────────────────────────────────────────────
+
+def _extract_mem(content: str) -> Optional[tuple[int, int]]:
+    """Returns (used_kb, total_kb) or None."""
+    sec = parse_section(content, "mem") or ""
+    m: dict[str, int] = {}
+    for line in sec.splitlines():
+        p = line.split()
+        if len(p) >= 2:
+            try:
+                m[p[0].rstrip(":")] = int(p[1])
+            except ValueError:
+                pass
+    total = m.get("MemTotal", 0)
+    if not total:
+        return None
+    avail = m.get("MemAvailable") or m.get("MemFree", 0)
+    return total - avail, total
+
+
+def _extract_cpu(content: str, os_type: str) -> Optional[str]:
+    """Returns a short CPU load string or None."""
+    if os_type == "windows":
+        sec = parse_section(content, "wmi_cpuload") or ""
+        for line in sec.splitlines():
+            if "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 2 and parts[0].isdigit():
+                    try:
+                        return f"queue={int(parts[0])}"
+                    except ValueError:
+                        pass
+        return None
+    else:
+        sec = parse_section(content, "cpu") or ""
+        parts = sec.split()
+        if len(parts) >= 3:
+            return f"{parts[0]} / {parts[1]} / {parts[2]}"
+        return None
+
+
+def _pick_samples(snaps: list[tuple[datetime, str]],
+                  start: datetime, end: datetime,
+                  n: int) -> list[tuple[datetime, str]]:
+    """Pick n evenly distributed snapshots across [start, end]."""
+    if not snaps or n <= 0:
+        return []
+    if len(snaps) <= n:
+        return snaps
+    span = (end - start).total_seconds()
+    selected = []
+    for i in range(n):
+        target = start + timedelta(seconds=span * (i + 0.5) / n)
+        closest = min(snaps, key=lambda x: abs((x[0] - target).total_seconds()))
+        if not selected or selected[-1][0] != closest[0]:
+            selected.append(closest)
+    return selected
+
+
+def tool_get_history_range(host: str, metric: str, frm: str, to: str,
+                            samples: int = 10) -> str:
+    if not HISTORY_DIR:
+        return "CHECKMK_HISTORY_DIR not configured."
+    if metric not in ("mem", "cpu"):
+        return "metric must be 'mem' or 'cpu'."
+    start = _parse_at(frm)
+    end   = _parse_at(to)
+    if not start:
+        return f"Timestamp 'from' not recognised: '{frm}'"
+    if not end:
+        return f"Timestamp 'to' not recognised: '{to}'"
+    if end <= start:
+        return "'to' must be after 'from'."
+    samples = max(2, min(samples, 50))
+
+    snaps = _get_snapshots(host, start, end)
+    if not snaps:
+        return f"No snapshots found for '{host}' between {frm} and {to}."
+
+    chosen = _pick_samples(snaps, start, end, samples)
+    os_type = detect_os(chosen[0][1])
+
+    header = (f"=== {host} — {metric} — "
+              f"{start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%Y-%m-%d %H:%M')} "
+              f"({len(chosen)} samples, OS: {os_type}) ===")
+    lines = [header]
+
+    if metric == "mem":
+        values = []
+        for ts, content in chosen:
+            r = _extract_mem(content)
+            if r:
+                values.append((ts, r[0], r[1]))
+        if not values:
+            return f"No mem data found for '{host}' in the given range."
+        peak_ts = max(values, key=lambda x: x[1])[0]
+        for ts, used, total in values:
+            pct = 100 * used / total if total else 0
+            marker = "  ← peak" if ts == peak_ts else ""
+            lines.append(f"  {ts.strftime('%H:%M:%S')}   "
+                         f"{_fmt_kb(used):>10} / {_fmt_kb(total):>10}  ({pct:4.0f}%){marker}")
+
+    else:  # cpu
+        values = []
+        for ts, content in chosen:
+            r = _extract_cpu(content, os_type)
+            if r:
+                values.append((ts, r))
+        if not values:
+            return f"No cpu data found for '{host}' in the given range."
+        label = "load 1/5/15 min" if os_type != "windows" else "processor queue"
+        lines.append(f"  {'time':<10}  {label}")
+        for ts, val in values:
+            lines.append(f"  {ts.strftime('%H:%M:%S')}   {val}")
+
+    return "\n".join(lines)
+
+
 # ── Historical tool functions ─────────────────────────────────────────────
 
 def tool_get_history_overview(host: str, at: str, window_minutes: int = 10) -> str:
@@ -863,6 +981,27 @@ _HISTORY_TOOLS = [
             "required": ["host", "at", "section"],
         },
     },
+    {
+        "name": "get_history_range",
+        "description": (
+            "Time series of a metric for a host over a time range (reads from archive). "
+            "metric: 'mem' (RAM used/total/%) or 'cpu' (load averages on Linux, processor queue on Windows). "
+            "samples: number of evenly distributed data points to return (default 10, max 50). "
+            "from/to: ISO-8601 timestamps, e.g. '2026-06-14T14:00' and '2026-06-14T15:00'. "
+            "Use this to spot trends and peaks during an incident window."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host":    {"type": "string"},
+                "metric":  {"type": "string", "enum": ["mem", "cpu"]},
+                "from":    {"type": "string", "description": "Start timestamp (ISO-8601)"},
+                "to":      {"type": "string", "description": "End timestamp (ISO-8601)"},
+                "samples": {"type": "integer", "default": 10, "minimum": 2, "maximum": 50},
+            },
+            "required": ["host", "metric", "from", "to"],
+        },
+    },
 ]
 
 TOOLS = [
@@ -995,6 +1134,11 @@ def dispatch(name: str, args: dict) -> str:
         return tool_get_history_section(
             args["host"], args["at"], args["section"],
             args.get("window_minutes", 10))
+    if name == "get_history_range":
+        return tool_get_history_range(
+            args["host"], args["metric"],
+            args["from"], args["to"],
+            args.get("samples", 10))
     return f"Unknown tool: {name}"
 
 
