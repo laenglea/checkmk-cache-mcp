@@ -27,7 +27,7 @@ CheckMK agent cache  →  Collector (inotify)  →  Hourly tar.zst archives
 ## Quick install
 
 ```bash
-git clone https://github.com/yourorg/checkmk-cache-mcp.git
+git clone https://github.com/laenglea/checkmk-cache-mcp.git
 cd checkmk-cache-mcp
 sudo ./install.sh mysite          # replace mysite with your OMD site name
 ```
