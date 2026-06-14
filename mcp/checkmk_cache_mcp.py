@@ -984,11 +984,11 @@ _HISTORY_TOOLS = [
     {
         "name": "get_history_range",
         "description": (
-            "Time series of a metric for a host over a time range (reads from archive). "
+            "Time series of RAM or CPU over a time range — use this for trend analysis, NOT for process lists. "
             "metric: 'mem' (RAM used/total/%) or 'cpu' (load averages on Linux, processor queue on Windows). "
-            "samples: number of evenly distributed data points to return (default 10, max 50). "
-            "from/to: ISO-8601 timestamps, e.g. '2026-06-14T14:00' and '2026-06-14T15:00'. "
-            "Use this to spot trends and peaks during an incident window."
+            "from/to: ISO-8601 range, e.g. '2026-06-14T14:00' / '2026-06-14T15:00'. "
+            "samples: evenly distributed data points (default 10, max 50). "
+            "Does NOT support sort_by, limit, filter_cmd, or window_minutes — use get_history_processes for that."
         ),
         "inputSchema": {
             "type": "object",
@@ -1117,11 +1117,16 @@ def dispatch(name: str, args: dict) -> str:
     if name == "get_section":
         return tool_get_section(args["host"], args["section"])
     if name == "get_history_overview":
-        return tool_get_history_overview(
-            args["host"], args["at"], args.get("window_minutes", 10))
+        at = args.get("at") or args.get("from")
+        if not at:
+            return "Error: missing required argument 'at' (ISO-8601 timestamp)"
+        return tool_get_history_overview(args["host"], at, args.get("window_minutes", 10))
     if name == "get_history_processes":
+        at = args.get("at") or args.get("from")
+        if not at:
+            return "Error: missing required argument 'at' (ISO-8601 timestamp)"
         return tool_get_history_processes(
-            args["host"], args["at"],
+            args["host"], at,
             args.get("sort_by", "rss"),
             args.get("limit", 15),
             args.get("filter_cmd"),
@@ -1131,14 +1136,22 @@ def dispatch(name: str, args: dict) -> str:
             args.get("aggregate", False),
         )
     if name == "get_history_section":
-        return tool_get_history_section(
-            args["host"], args["at"], args["section"],
-            args.get("window_minutes", 10))
+        at = args.get("at") or args.get("from")
+        if not at:
+            return "Error: missing required argument 'at' (ISO-8601 timestamp)"
+        section = args.get("section")
+        if not section:
+            return "Error: missing required argument 'section'"
+        return tool_get_history_section(args["host"], at, section, args.get("window_minutes", 10))
     if name == "get_history_range":
-        return tool_get_history_range(
-            args["host"], args["metric"],
-            args["from"], args["to"],
-            args.get("samples", 10))
+        frm = args.get("from") or args.get("at")
+        to  = args.get("to")
+        metric = args.get("metric")
+        if not frm or not to:
+            return "Error: missing required arguments 'from' and 'to' (ISO-8601 timestamps)"
+        if not metric:
+            return "Error: missing required argument 'metric' ('mem' or 'cpu')"
+        return tool_get_history_range(args["host"], metric, frm, to, args.get("samples", 10))
     return f"Unknown tool: {name}"
 
 
