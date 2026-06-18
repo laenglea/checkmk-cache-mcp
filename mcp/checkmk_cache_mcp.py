@@ -14,6 +14,8 @@ Configuration (env vars):
   MCP_API_KEY          Default: "" (no auth)
 """
 from __future__ import annotations
+import fnmatch
+import hmac
 import json
 import os
 import re
@@ -32,6 +34,9 @@ FILE_TZ      = ZoneInfo(os.environ.get("CHECKMK_FILE_TZ", "Europe/Vaduz"))
 MCP_HOST     = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT     = int(os.environ.get("MCP_PORT", "8765"))
 API_KEY      = os.environ.get("MCP_API_KEY", "")
+
+_ZSTD_AVAILABLE = bool(subprocess.run(["which", "zstd"], capture_output=True).returncode == 0)
+_archive_errors: list[str] = []
 
 SECTION_ALIASES: dict[str, list[str]] = {
     # Linux
@@ -146,15 +151,17 @@ def _read_files_from_dir(bucket: Path, host: str,
 def _read_files_from_archive(archive: Path, host: str,
                               start: datetime, end: datetime) -> list[tuple[datetime, str]]:
     results = []
+    proc = None
     try:
         if archive.name.endswith(".tar.zst"):
+            if not _ZSTD_AVAILABLE:
+                raise RuntimeError("zstd binary not found — install zstd to read .tar.zst archives")
             proc = subprocess.Popen(
                 ["zstd", "-d", "-c", str(archive)],
                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             )
             tf = tarfile.open(fileobj=proc.stdout, mode="r|")
         else:
-            proc = None
             tf = tarfile.open(archive, "r:*")
         with tf:
             for member in tf:
@@ -171,8 +178,8 @@ def _read_files_from_archive(archive: Path, host: str,
                     results.append((ts, f.read().decode(errors="replace")))
         if proc:
             proc.wait()
-    except Exception:
-        pass
+    except Exception as e:
+        _archive_errors.append(f"{archive.name}: {e}")
     return results
 
 
@@ -242,9 +249,9 @@ def parse_processes_linux(ps_text: str, filter_user: str = None,
         if len(parts) < 8:
             continue
         _, user, vsz, rss, cpu_time, elapsed, pid, cmd = parts
-        if filter_user and filter_user.lower() not in user.lower():
+        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower() if "*" in filter_user else f"*{filter_user.lower()}*"):
             continue
-        if filter_cmd and filter_cmd.lower() not in cmd.lower():
+        if filter_cmd and not fnmatch.fnmatch(cmd.lower(), filter_cmd.lower() if "*" in filter_cmd else f"*{filter_cmd.lower()}*"):
             continue
         if filter_regex and not filter_regex.search(cmd):
             continue
@@ -289,7 +296,7 @@ def parse_processes_windows(ps_text: str,
         if len(parts) < 2:
             continue
         meta, name = parts[0], parts[1].strip()
-        if filter_cmd and filter_cmd.lower() not in name.lower():
+        if filter_cmd and not fnmatch.fnmatch(name.lower(), filter_cmd.lower() if "*" in filter_cmd else f"*{filter_cmd.lower()}*"):
             continue
         if filter_regex and not filter_regex.search(name):
             continue
@@ -297,7 +304,7 @@ def parse_processes_windows(ps_text: str,
         if not m:
             continue
         user = m.group(1)
-        if filter_user and filter_user.lower() not in user.lower():
+        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower() if "*" in filter_user else f"*{filter_user.lower()}*"):
             continue
         procs.append({
             "name":         name,
@@ -597,13 +604,17 @@ def _overview_df(content: str, os_type: str) -> list[str]:
 
 # ── Tool implementations ────────────────────────────────────────────────────
 
-def tool_list_hosts() -> str:
+def tool_list_hosts(pattern: str = None) -> str:
     if not BASE_DIR.exists():
         return f"Cache directory not found: {BASE_DIR}"
     hosts = sorted(p.name for p in BASE_DIR.iterdir() if p.is_file())
+    if pattern:
+        hosts = [h for h in hosts if fnmatch.fnmatch(h.lower(), pattern.lower())]
     if not hosts:
-        return f"No host files found in {BASE_DIR}"
-    lines = [f"Hosts in {BASE_DIR} ({len(hosts)}):"]
+        return (f"No hosts matching '{pattern}' in {BASE_DIR}"
+                if pattern else f"No host files found in {BASE_DIR}")
+    label = f"Hosts in {BASE_DIR} ({len(hosts)}" + (f", filter='{pattern}'" if pattern else "") + "):"
+    lines = [label]
     for h in hosts:
         lines.append(f"  {h:<40} {_cache_age(h)}")
     return "\n".join(lines)
@@ -663,8 +674,22 @@ def tool_get_processes(host: str, sort_by: str = "rss", limit: int = 15,
         sort_key = _SORT_KEY_LNX.get(sort_by, "rss_kb")
         procs.sort(key=lambda p: p[sort_key], reverse=sort_key not in ("cmd",))
         header = (f"Host: {host}  OS: linux  total={len(procs)}"
-                  f"  sort={sort_by}  showing={min(limit, len(procs))}")
+                  f"  sort={sort_by}  showing={min(limit, len(procs))}"
+                  + ("  [note: aggregate ignored on Linux]" if aggregate else ""))
         return header + "\n" + _format_procs_linux(procs, limit)
+
+
+def tool_list_sections(host: str) -> str:
+    content = _read_host(host)
+    if not content:
+        return f"Host '{host}' not found in {BASE_DIR}"
+    sections = re.findall(r"^<<<([^>]+)>>>", content, re.MULTILINE)
+    if not sections:
+        return f"No sections found for host '{host}'"
+    lines = [f"Sections for {host} ({len(sections)}):"]
+    for s in sections:
+        lines.append(f"  {s}")
+    return "\n".join(lines)
 
 
 def tool_get_section(host: str, section: str) -> str:
@@ -680,6 +705,124 @@ def tool_get_section(host: str, section: str) -> str:
     if not parts:
         return f"Section '{section}' not found for host '{host}'"
     return "\n\n".join(parts)
+
+
+# ── History range helpers ─────────────────────────────────────────────────
+
+def _extract_mem(content: str) -> Optional[tuple[int, int]]:
+    """Returns (used_kb, total_kb) or None."""
+    sec = parse_section(content, "mem") or ""
+    m: dict[str, int] = {}
+    for line in sec.splitlines():
+        p = line.split()
+        if len(p) >= 2:
+            try:
+                m[p[0].rstrip(":")] = int(p[1])
+            except ValueError:
+                pass
+    total = m.get("MemTotal", 0)
+    if not total:
+        return None
+    avail = m.get("MemAvailable") or m.get("MemFree", 0)
+    return total - avail, total
+
+
+def _extract_cpu(content: str, os_type: str) -> Optional[str]:
+    """Returns a short CPU load string or None."""
+    if os_type == "windows":
+        sec = parse_section(content, "wmi_cpuload") or ""
+        for line in sec.splitlines():
+            if "|" in line:
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) >= 2 and parts[0].isdigit():
+                    try:
+                        return f"queue={int(parts[0])}"
+                    except ValueError:
+                        pass
+        return None
+    else:
+        sec = parse_section(content, "cpu") or ""
+        parts = sec.split()
+        if len(parts) >= 3:
+            return f"{parts[0]} / {parts[1]} / {parts[2]}"
+        return None
+
+
+def _pick_samples(snaps: list[tuple[datetime, str]],
+                  start: datetime, end: datetime,
+                  n: int) -> list[tuple[datetime, str]]:
+    """Pick n evenly distributed snapshots across [start, end]."""
+    if not snaps or n <= 0:
+        return []
+    if len(snaps) <= n:
+        return snaps
+    span = (end - start).total_seconds()
+    selected = []
+    for i in range(n):
+        target = start + timedelta(seconds=span * (i + 0.5) / n)
+        closest = min(snaps, key=lambda x: abs((x[0] - target).total_seconds()))
+        if not selected or selected[-1][0] != closest[0]:
+            selected.append(closest)
+    return selected
+
+
+def tool_get_history_range(host: str, metric: str, frm: str, to: str,
+                            samples: int = 10) -> str:
+    if not HISTORY_DIR:
+        return "CHECKMK_HISTORY_DIR not configured."
+    if metric not in ("mem", "cpu"):
+        return "metric must be 'mem' or 'cpu'."
+    start = _parse_at(frm)
+    end   = _parse_at(to)
+    if not start:
+        return f"Timestamp 'from' not recognised: '{frm}'"
+    if not end:
+        return f"Timestamp 'to' not recognised: '{to}'"
+    if end <= start:
+        return "'to' must be after 'from'."
+    samples = max(2, min(samples, 50))
+
+    snaps = _get_snapshots(host, start, end)
+    if not snaps:
+        return f"No snapshots found for '{host}' between {frm} and {to}."
+
+    chosen = _pick_samples(snaps, start, end, samples)
+    os_type = detect_os(chosen[0][1])
+
+    header = (f"=== {host} — {metric} — "
+              f"{start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%Y-%m-%d %H:%M')} "
+              f"({len(chosen)} samples, OS: {os_type}) ===")
+    lines = [header]
+
+    if metric == "mem":
+        values = []
+        for ts, content in chosen:
+            r = _extract_mem(content)
+            if r:
+                values.append((ts, r[0], r[1]))
+        if not values:
+            return f"No mem data found for '{host}' in the given range."
+        peak_ts = max(values, key=lambda x: x[1])[0]
+        for ts, used, total in values:
+            pct = 100 * used / total if total else 0
+            marker = "  ← peak" if ts == peak_ts else ""
+            lines.append(f"  {ts.strftime('%H:%M:%S')}   "
+                         f"{_fmt_kb(used):>10} / {_fmt_kb(total):>10}  ({pct:4.0f}%){marker}")
+
+    else:  # cpu
+        values = []
+        for ts, content in chosen:
+            r = _extract_cpu(content, os_type)
+            if r:
+                values.append((ts, r))
+        if not values:
+            return f"No cpu data found for '{host}' in the given range."
+        label = "load 1/5/15 min" if os_type != "windows" else "processor queue"
+        lines.append(f"  {'time':<10}  {label}")
+        for ts, val in values:
+            lines.append(f"  {ts.strftime('%H:%M:%S')}   {val}")
+
+    return "\n".join(lines)
 
 
 # ── Historical tool functions ─────────────────────────────────────────────
@@ -738,7 +881,6 @@ def tool_get_history_processes(host: str, at: str, sort_by: str = "rss",
         header = (f"Host: {host}  OS: windows  snapshot: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}"
                   f"  total={len(procs)}  sort={sort_by}  showing={min(limit, len(procs))}"
                   f"{'  [aggregated]' if aggregate else ''}")
-        # FIX: aggregate-Parameter wird jetzt korrekt weitergegeben
         return header + "\n" + _format_procs_windows(procs, limit, aggregate)
     else:
         ps_raw = parse_section(content, "ps_lnx") or ""
@@ -750,7 +892,8 @@ def tool_get_history_processes(host: str, at: str, sort_by: str = "rss",
         sort_key = _SORT_KEY_LNX.get(sort_by, "rss_kb")
         procs.sort(key=lambda p: p[sort_key], reverse=sort_key not in ("cmd",))
         header = (f"Host: {host}  OS: linux  snapshot: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}"
-                  f"  total={len(procs)}  sort={sort_by}  showing={min(limit, len(procs))}")
+                  f"  total={len(procs)}  sort={sort_by}  showing={min(limit, len(procs))}"
+                  + ("  [note: aggregate ignored on Linux]" if aggregate else ""))
         return header + "\n" + _format_procs_linux(procs, limit)
 
 
@@ -803,7 +946,9 @@ _HISTORY_TOOLS = [
             "Automatically detects Windows or Linux. "
             "Windows sort_by: rss (resident/working-set), vsz (virtual), cpu, pagefile, name, handles, threads. "
             "Linux sort_by: rss, vsz, cpu_time, elapsed, cmd. "
-            "aggregate=true groups multiple instances of the same Windows process name."
+            "filter_cmd OR filter_regex (not both — AND logic). "
+            "aggregate=true (Windows only, ignored on Linux): groups multiple instances of the same process name. "
+            "window_minutes: search radius around 'at' to find the nearest snapshot (default 10)."
         ),
         "inputSchema": {
             "type": "object",
@@ -839,13 +984,57 @@ _HISTORY_TOOLS = [
             "required": ["host", "at", "section"],
         },
     },
+    {
+        "name": "get_history_range",
+        "description": (
+            "Time series of RAM or CPU over a time range — use this for trend analysis, NOT for process lists. "
+            "metric: 'mem' (RAM used/total/%) or 'cpu' (load averages on Linux, processor queue on Windows). "
+            "from/to: ISO-8601 range, e.g. '2026-06-14T14:00' / '2026-06-14T15:00'. "
+            "samples: evenly distributed data points (default 10, max 50). "
+            "Does NOT support sort_by, limit, filter_cmd, filter_user, aggregate, or window_minutes — use get_history_processes for that."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "host":    {"type": "string"},
+                "metric":  {"type": "string", "enum": ["mem", "cpu"]},
+                "from":    {"type": "string", "description": "Start timestamp (ISO-8601)"},
+                "to":      {"type": "string", "description": "End timestamp (ISO-8601)"},
+                "samples": {"type": "integer", "default": 10, "minimum": 2, "maximum": 50},
+            },
+            "required": ["host", "metric", "from", "to"],
+        },
+    },
 ]
 
 TOOLS = [
     {
         "name": "list_hosts",
-        "description": "List all available hosts in the cache directory with cache file age.",
-        "inputSchema": {"type": "object", "properties": {}, "required": []},
+        "description": (
+            "List available hosts in the cache directory with cache file age. "
+            "Supports glob pattern filtering, e.g. pattern='web*' or pattern='*prod*'. "
+            "Omit pattern to list all hosts."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "pattern": {"type": "string",
+                            "description": "Optional glob pattern (case-insensitive), e.g. 'web*', '*db*'"},
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "list_sections",
+        "description": (
+            "List all CheckMK sections present in the cached agent output for a host. "
+            "Only call this if you are unsure which sections exist — skip it when the section name is already known."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {"host": {"type": "string"}},
+            "required": ["host"],
+        },
     },
     {
         "name": "get_overview",
@@ -866,10 +1055,10 @@ TOOLS = [
             "Process list, sorted and limited server-side. Automatically detects Windows or Linux. "
             "Windows sort_by: rss (resident/working-set, default), vsz (virtual), cpu, pagefile, name, handles, threads. "
             "Linux sort_by: rss (default), vsz, cpu_time, elapsed, cmd. "
-            "filter_cmd: case-insensitive substring. "
-            "filter_regex: Python regex on command/process name. "
-            "filter_user: case-insensitive substring on username. "
-            "aggregate=true (Windows only): groups multiple instances of the same process name."
+            "filter_cmd: case-insensitive substring or glob (e.g. 'java', 'java*', '*agent*'). "
+            "filter_regex: Python regex on command/process name — use either filter_cmd OR filter_regex, not both (AND logic). "
+            "filter_user: case-insensitive glob on username (e.g. 'oracle', 'svc_*', '*'). "
+            "aggregate=true (Windows only, ignored on Linux): groups multiple instances of the same process name."
         ),
         "inputSchema": {
             "type": "object",
@@ -913,7 +1102,9 @@ if HISTORY_DIR:
 
 def dispatch(name: str, args: dict) -> str:
     if name == "list_hosts":
-        return tool_list_hosts()
+        return tool_list_hosts(args.get("pattern"))
+    if name == "list_sections":
+        return tool_list_sections(args["host"])
     if name == "get_overview":
         return tool_get_overview(args["host"])
     if name == "get_processes":
@@ -929,11 +1120,16 @@ def dispatch(name: str, args: dict) -> str:
     if name == "get_section":
         return tool_get_section(args["host"], args["section"])
     if name == "get_history_overview":
-        return tool_get_history_overview(
-            args["host"], args["at"], args.get("window_minutes", 10))
+        at = args.get("at") or args.get("from")
+        if not at:
+            return "Error: missing required argument 'at' (ISO-8601 timestamp)"
+        return tool_get_history_overview(args["host"], at, args.get("window_minutes", 10))
     if name == "get_history_processes":
+        at = args.get("at") or args.get("from")
+        if not at:
+            return "Error: missing required argument 'at' (ISO-8601 timestamp)"
         return tool_get_history_processes(
-            args["host"], args["at"],
+            args["host"], at,
             args.get("sort_by", "rss"),
             args.get("limit", 15),
             args.get("filter_cmd"),
@@ -943,9 +1139,22 @@ def dispatch(name: str, args: dict) -> str:
             args.get("aggregate", False),
         )
     if name == "get_history_section":
-        return tool_get_history_section(
-            args["host"], args["at"], args["section"],
-            args.get("window_minutes", 10))
+        at = args.get("at") or args.get("from")
+        if not at:
+            return "Error: missing required argument 'at' (ISO-8601 timestamp)"
+        section = args.get("section")
+        if not section:
+            return "Error: missing required argument 'section'"
+        return tool_get_history_section(args["host"], at, section, args.get("window_minutes", 10))
+    if name == "get_history_range":
+        frm = args.get("from") or args.get("at")
+        to  = args.get("to")
+        metric = args.get("metric")
+        if not frm or not to:
+            return "Error: missing required arguments 'from' and 'to' (ISO-8601 timestamps)"
+        if not metric:
+            return "Error: missing required argument 'metric' ('mem' or 'cpu')"
+        return tool_get_history_range(args["host"], metric, frm, to, args.get("samples", 10))
     return f"Unknown tool: {name}"
 
 
@@ -990,9 +1199,9 @@ def _check_auth(request: Request) -> bool:
     if not API_KEY:
         return True
     auth = request.headers.get("authorization", "")
-    if auth.lower().startswith("bearer ") and auth[7:] == API_KEY:
-        return True
-    return request.headers.get("x-api-key", "") == API_KEY
+    if auth.lower().startswith("bearer "):
+        return hmac.compare_digest(auth[7:], API_KEY)
+    return hmac.compare_digest(request.headers.get("x-api-key", ""), API_KEY)
 
 
 @app.api_route("/mcp", methods=["OPTIONS", "GET", "POST"])
@@ -1045,7 +1254,7 @@ async def mcp_endpoint(request: Request):
         except Exception as e:
             text = f"Error: {e}"
         result = {"content": [{"type": "text", "text": text}],
-                  "isError": text.startswith("Error")}
+                  "isError": isinstance(text, str) and re.match(r"^(Error|Unknown tool):", text) is not None}
     else:
         result = {"code": -32601, "message": f"Unknown method: {method}"}
 
@@ -1063,12 +1272,15 @@ async def mcp_endpoint(request: Request):
 @app.get("/health")
 async def health():
     hosts = sorted(p.name for p in BASE_DIR.iterdir() if p.is_file()) if BASE_DIR.exists() else []
+    recent_errors = _archive_errors[-10:] if _archive_errors else []
     return {
-        "status": "ok",
+        "status": "degraded" if recent_errors else "ok",
         "cache_dir": str(BASE_DIR),
         "history_dir": str(HISTORY_DIR) if HISTORY_DIR else None,
+        "zstd_available": _ZSTD_AVAILABLE,
         "host_count": len(hosts),
         "hosts": hosts,
+        "recent_archive_errors": recent_errors,
     }
 
 
@@ -1077,7 +1289,8 @@ if __name__ == "__main__":
     print("CheckMK Cache MCP  v2.1 (Windows+Linux)")
     print(f"  Cache:    {BASE_DIR}")
     print(f"  History:  {HISTORY_DIR or '(disabled — set CHECKMK_HISTORY_DIR to enable)'}")
-    print(f"  Tools:    {len(TOOLS)} ({4} current{f' + {n_hist} historical' if HISTORY_DIR else ''})")
+    n_current = len(TOOLS) - (n_hist if HISTORY_DIR else 0)
+    print(f"  Tools:    {len(TOOLS)} ({n_current} current{f' + {n_hist} historical' if HISTORY_DIR else ''})")
     print(f"  Endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
     print(f"  Health:   http://{MCP_HOST}:{MCP_PORT}/health")
     print(f"  API-Key:  {'(set)' if API_KEY else '(none — set MCP_API_KEY to enable auth)'}")
