@@ -6,12 +6,14 @@ Reads current agent-output files from a flat cache directory
 (one file per host, named by hostname) and exposes token-efficient tools.
 
 Configuration (env vars):
-  CHECKMK_CACHE_DIR    Default: /cachehistory/prodhubli
-  CHECKMK_HISTORY_DIR  Default: "" (empty = historical tools disabled)
-  CHECKMK_FILE_TZ      Default: Europe/Vaduz (timezone of archive filenames)
-  MCP_HOST             Default: 0.0.0.0
-  MCP_PORT             Default: 8765
-  MCP_API_KEY          Default: "" (no auth)
+  CHECKMK_CACHE_DIR       Default: /cachehistory/prodhubli
+  CHECKMK_HISTORY_DIR     Default: "" (empty = historical tools disabled)
+  CHECKMK_FILE_TZ         Default: Europe/Vaduz (timezone of archive filenames)
+  CHECKMK_MEM_CACHE_TTL   Default: 0 (mtime-only invalidation; set seconds to
+                          additionally cap how long a parsed snapshot is reused)
+  MCP_HOST                Default: 0.0.0.0
+  MCP_PORT                Default: 8765
+  MCP_API_KEY             Default: "" (no auth)
 """
 from __future__ import annotations
 import fnmatch
@@ -21,10 +23,11 @@ import os
 import re
 import subprocess
 import tarfile
+import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Union
 from zoneinfo import ZoneInfo
 
 BASE_DIR     = Path(os.environ.get("CHECKMK_CACHE_DIR", "/cachehistory/prodhubli"))
@@ -34,6 +37,10 @@ FILE_TZ      = ZoneInfo(os.environ.get("CHECKMK_FILE_TZ", "Europe/Vaduz"))
 MCP_HOST     = os.environ.get("MCP_HOST", "0.0.0.0")
 MCP_PORT     = int(os.environ.get("MCP_PORT", "8765"))
 API_KEY      = os.environ.get("MCP_API_KEY", "")
+# Optional in-memory cache TTL (seconds). 0 = mtime-only (no time-based expiry).
+# Helps within bursts of tool calls on the same host even if the source file
+# is rewritten every minute.
+MEM_CACHE_TTL = float(os.environ.get("CHECKMK_MEM_CACHE_TTL", "0"))
 
 _ZSTD_AVAILABLE = bool(subprocess.run(["which", "zstd"], capture_output=True).returncode == 0)
 _archive_errors: list[str] = []
@@ -81,6 +88,68 @@ def _cache_age(host: str) -> str:
     if age < 3600:
         return f"{age // 60}m{age % 60:02d}s ago"
     return f"{age // 3600}h{(age % 3600) // 60}m ago"
+
+
+# ── Section tokenizer + per-host cache ──────────────────────────────────────
+#
+# parse_all_sections() walks the agent output ONCE and returns
+# {section_name: body}. This replaces N separate full-file regex scans
+# (detect_os alone made up to 4) with a single linear pass.
+#
+# _read_host_sections() additionally caches the parsed dict keyed by mtime.
+# When the source file is rewritten (every minute or so), the mtime changes
+# and we re-parse — so we never serve stale data. Within a burst of tool
+# calls on the same host (the common LLM pattern: overview → processes →
+# section), all calls after the first are O(1) dict lookups.
+
+_SECTION_HDR_RE = re.compile(r"^<<<([^>:\s]+)(?::[^>]*)?>>>\s*$", re.MULTILINE)
+
+# host -> (mtime, cached_at, sections_dict)
+_section_cache: dict[str, tuple[float, float, dict[str, str]]] = {}
+
+
+def parse_all_sections(content: str) -> dict[str, str]:
+    """Tokenize agent output into {section_name: body} in a single pass.
+
+    First occurrence wins (matches the previous parse_section behavior).
+    """
+    sections: dict[str, str] = {}
+    matches = list(_SECTION_HDR_RE.finditer(content))
+    n = len(matches)
+    for i, m in enumerate(matches):
+        name = m.group(1)
+        if name in sections:
+            continue
+        body_start = m.end()
+        body_end = matches[i + 1].start() if i + 1 < n else len(content)
+        sections[name] = content[body_start:body_end].strip()
+    return sections
+
+
+def _read_host_sections(host: str) -> Optional[dict[str, str]]:
+    """Read host file and return tokenized sections, with mtime+TTL cache."""
+    p = BASE_DIR / host
+    try:
+        st = p.stat()
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return None
+    if not p.is_file():
+        return None
+    mtime = st.st_mtime
+    now = time.time()
+    cached = _section_cache.get(host)
+    if cached is not None:
+        c_mtime, c_at, c_sections = cached
+        # mtime unchanged AND (TTL disabled OR within TTL) → cache hit
+        if c_mtime == mtime and (MEM_CACHE_TTL <= 0 or now - c_at <= MEM_CACHE_TTL):
+            return c_sections
+    try:
+        content = p.read_text(errors="replace")
+    except OSError:
+        return None
+    sections = parse_all_sections(content)
+    _section_cache[host] = (mtime, now, sections)
+    return sections
 
 
 # ── Historical archive helpers ──────────────────────────────────────────────
@@ -205,7 +274,16 @@ def _nearest_snap(host: str, at: datetime,
 
 # ── Section parsing ─────────────────────────────────────────────────────────
 
-def parse_section(content: str, section_name: str) -> Optional[str]:
+def parse_section(content: Union[str, dict], section_name: str) -> Optional[str]:
+    """Look up a CheckMK section.
+
+    Accepts either a tokenized {name: body} dict (preferred — O(1) lookup)
+    or raw agent-output text (fallback — runs a regex over the full string).
+    All existing helpers can pass either, so the call sites can be migrated
+    incrementally.
+    """
+    if isinstance(content, dict):
+        return content.get(section_name)
     pattern = re.compile(
         r"^<<<" + re.escape(section_name) + r"(?::[^>]*)?>>\>\n(.*?)(?=^<<<|\Z)",
         re.MULTILINE | re.DOTALL,
@@ -214,16 +292,16 @@ def parse_section(content: str, section_name: str) -> Optional[str]:
     return m.group(1).strip() if m else None
 
 
-def detect_os(content: str) -> str:
+def detect_os(content: Union[str, dict]) -> str:
     """Erkennt OS anhand von AgentOS-Header oder vorhandenen Sections."""
-    m = re.search(r"^AgentOS:\s*(\S+)", content, re.MULTILINE)
+    chk = parse_section(content, "check_mk") or ""
+    m = re.search(r"^AgentOS:\s*(\S+)", chk, re.MULTILINE)
     if m:
         return m.group(1).lower()
     if parse_section(content, "wmi_cpuload") or parse_section(content, "winperf_processor"):
         return "windows"
     if parse_section(content, "ps_lnx"):
         return "linux"
-    chk = parse_section(content, "check_mk") or ""
     if "windows" in chk.lower():
         return "windows"
     return "linux"
@@ -231,10 +309,18 @@ def detect_os(content: str) -> str:
 
 # ── Linux process parsing ───────────────────────────────────────────────────
 
+def _glob_pat(s: str) -> str:
+    """Build a case-insensitive fnmatch pattern from a substring or glob."""
+    s = s.lower()
+    return s if "*" in s else f"*{s}*"
+
+
 def parse_processes_linux(ps_text: str, filter_user: str = None,
                           filter_cmd: str = None,
                           filter_regex: re.Pattern = None) -> list[dict]:
     """Parse ps_lnx section. Columns: CGROUP USER VSZ RSS TIME ELAPSED PID COMMAND"""
+    user_pat = _glob_pat(filter_user) if filter_user else None
+    cmd_pat  = _glob_pat(filter_cmd)  if filter_cmd  else None
     procs = []
     in_procs = False
     for line in ps_text.splitlines():
@@ -249,9 +335,9 @@ def parse_processes_linux(ps_text: str, filter_user: str = None,
         if len(parts) < 8:
             continue
         _, user, vsz, rss, cpu_time, elapsed, pid, cmd = parts
-        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower() if "*" in filter_user else f"*{filter_user.lower()}*"):
+        if user_pat and not fnmatch.fnmatch(user.lower(), user_pat):
             continue
-        if filter_cmd and not fnmatch.fnmatch(cmd.lower(), filter_cmd.lower() if "*" in filter_cmd else f"*{filter_cmd.lower()}*"):
+        if cmd_pat and not fnmatch.fnmatch(cmd.lower(), cmd_pat):
             continue
         if filter_regex and not filter_regex.search(cmd):
             continue
@@ -290,13 +376,15 @@ def parse_processes_windows(ps_text: str,
                              filter_cmd: str = None,
                              filter_user: str = None,
                              filter_regex: re.Pattern = None) -> list[dict]:
+    user_pat = _glob_pat(filter_user) if filter_user else None
+    cmd_pat  = _glob_pat(filter_cmd)  if filter_cmd  else None
     procs = []
     for line in ps_text.splitlines():
         parts = line.split("\t", 1)
         if len(parts) < 2:
             continue
         meta, name = parts[0], parts[1].strip()
-        if filter_cmd and not fnmatch.fnmatch(name.lower(), filter_cmd.lower() if "*" in filter_cmd else f"*{filter_cmd.lower()}*"):
+        if cmd_pat and not fnmatch.fnmatch(name.lower(), cmd_pat):
             continue
         if filter_regex and not filter_regex.search(name):
             continue
@@ -304,7 +392,7 @@ def parse_processes_windows(ps_text: str,
         if not m:
             continue
         user = m.group(1)
-        if filter_user and not fnmatch.fnmatch(user.lower(), filter_user.lower() if "*" in filter_user else f"*{filter_user.lower()}*"):
+        if user_pat and not fnmatch.fnmatch(user.lower(), user_pat):
             continue
         procs.append({
             "name":         name,
@@ -621,24 +709,24 @@ def tool_list_hosts(pattern: str = None) -> str:
 
 
 def tool_get_overview(host: str) -> str:
-    content = _read_host(host)
-    if not content:
+    sections = _read_host_sections(host)
+    if not sections:
         return f"Host '{host}' not found in {BASE_DIR}"
-    os_type = detect_os(content)
+    os_type = detect_os(sections)
     lines = [f"=== {host}  (cache: {_cache_age(host)}, OS: {os_type}) ==="]
-    lines += _overview_agent(content)
-    lines += _overview_uptime(content, os_type)
-    lines += _overview_cpu(content, os_type)
-    lines += _overview_mem(content, os_type)
-    lines += _overview_df(content, os_type)
+    lines += _overview_agent(sections)
+    lines += _overview_uptime(sections, os_type)
+    lines += _overview_cpu(sections, os_type)
+    lines += _overview_mem(sections, os_type)
+    lines += _overview_df(sections, os_type)
     return "\n".join(lines)
 
 
 def tool_get_processes(host: str, sort_by: str = "rss", limit: int = 15,
                        filter_cmd: str = None, filter_user: str = None,
                        filter_regex: str = None, aggregate: bool = False) -> str:
-    content = _read_host(host)
-    if not content:
+    sections = _read_host_sections(host)
+    if not sections:
         return f"Host '{host}' not found in {BASE_DIR}"
 
     compiled = None
@@ -648,10 +736,10 @@ def tool_get_processes(host: str, sort_by: str = "rss", limit: int = 15,
         except re.error as e:
             return f"Invalid filter_regex: {e}"
 
-    os_type = detect_os(content)
+    os_type = detect_os(sections)
 
     if os_type == "windows":
-        ps_raw = parse_section(content, "ps") or ""
+        ps_raw = sections.get("ps") or ""
         if not ps_raw:
             return f"No 'ps' section found for Windows host '{host}'"
         procs = parse_processes_windows(ps_raw, filter_cmd, filter_user, compiled)
@@ -665,7 +753,7 @@ def tool_get_processes(host: str, sort_by: str = "rss", limit: int = 15,
                   f"{'  [aggregated]' if aggregate else ''}")
         return header + "\n" + _format_procs_windows(procs, limit, aggregate)
     else:
-        ps_raw = parse_section(content, "ps_lnx") or ""
+        ps_raw = sections.get("ps_lnx") or ""
         if not ps_raw:
             return f"No ps_lnx section found for '{host}'"
         procs = parse_processes_linux(ps_raw, filter_user, filter_cmd, compiled)
@@ -680,26 +768,26 @@ def tool_get_processes(host: str, sort_by: str = "rss", limit: int = 15,
 
 
 def tool_list_sections(host: str) -> str:
-    content = _read_host(host)
-    if not content:
+    sections = _read_host_sections(host)
+    if not sections:
         return f"Host '{host}' not found in {BASE_DIR}"
-    sections = re.findall(r"^<<<([^>]+)>>>", content, re.MULTILINE)
     if not sections:
         return f"No sections found for host '{host}'"
-    lines = [f"Sections for {host} ({len(sections)}):"]
-    for s in sections:
+    names = sorted(sections.keys())
+    lines = [f"Sections for {host} ({len(names)}):"]
+    for s in names:
         lines.append(f"  {s}")
     return "\n".join(lines)
 
 
 def tool_get_section(host: str, section: str) -> str:
-    content = _read_host(host)
-    if not content:
+    sections = _read_host_sections(host)
+    if not sections:
         return f"Host '{host}' not found in {BASE_DIR}"
     names = SECTION_ALIASES.get(section, [section])
     parts = []
     for name in names:
-        raw = parse_section(content, name)
+        raw = sections.get(name)
         if raw:
             parts.append(f"<<<{name}>>>\n{raw}")
     if not parts:
@@ -787,7 +875,10 @@ def tool_get_history_range(host: str, metric: str, frm: str, to: str,
         return f"No snapshots found for '{host}' between {frm} and {to}."
 
     chosen = _pick_samples(snaps, start, end, samples)
-    os_type = detect_os(chosen[0][1])
+    # Pre-tokenize each snapshot once so the per-sample _extract_* calls
+    # become O(1) dict lookups instead of regex scans over the full text.
+    chosen_sec = [(ts, parse_all_sections(content)) for ts, content in chosen]
+    os_type = detect_os(chosen_sec[0][1])
 
     header = (f"=== {host} — {metric} — "
               f"{start.strftime('%Y-%m-%d %H:%M')} → {end.strftime('%Y-%m-%d %H:%M')} "
@@ -796,8 +887,8 @@ def tool_get_history_range(host: str, metric: str, frm: str, to: str,
 
     if metric == "mem":
         values = []
-        for ts, content in chosen:
-            r = _extract_mem(content)
+        for ts, sections in chosen_sec:
+            r = _extract_mem(sections)
             if r:
                 values.append((ts, r[0], r[1]))
         if not values:
@@ -811,8 +902,8 @@ def tool_get_history_range(host: str, metric: str, frm: str, to: str,
 
     else:  # cpu
         values = []
-        for ts, content in chosen:
-            r = _extract_cpu(content, os_type)
+        for ts, sections in chosen_sec:
+            r = _extract_cpu(sections, os_type)
             if r:
                 values.append((ts, r))
         if not values:
@@ -837,13 +928,14 @@ def tool_get_history_overview(host: str, at: str, window_minutes: int = 10) -> s
     if not snap:
         return f"No snapshot found for '{host}' around {at} (±{window_minutes // 2}min)"
     ts, content = snap
-    os_type = detect_os(content)
+    sections = parse_all_sections(content)
+    os_type = detect_os(sections)
     lines = [f"=== {host}  (snapshot: {ts.strftime('%Y-%m-%d %H:%M:%S %Z')}, OS: {os_type}) ==="]
-    lines += _overview_agent(content)
-    lines += _overview_uptime(content, os_type)
-    lines += _overview_cpu(content, os_type)
-    lines += _overview_mem(content, os_type)
-    lines += _overview_df(content, os_type)
+    lines += _overview_agent(sections)
+    lines += _overview_uptime(sections, os_type)
+    lines += _overview_cpu(sections, os_type)
+    lines += _overview_mem(sections, os_type)
+    lines += _overview_df(sections, os_type)
     return "\n".join(lines)
 
 
@@ -867,10 +959,11 @@ def tool_get_history_processes(host: str, at: str, sort_by: str = "rss",
     if not snap:
         return f"No snapshot found for '{host}' around {at}"
     ts, content = snap
-    os_type = detect_os(content)
+    sections = parse_all_sections(content)
+    os_type = detect_os(sections)
 
     if os_type == "windows":
-        ps_raw = parse_section(content, "ps") or ""
+        ps_raw = sections.get("ps") or ""
         if not ps_raw:
             return f"No 'ps' section in snapshot for '{host}' at {ts}"
         procs = parse_processes_windows(ps_raw, filter_cmd, filter_user, compiled)
@@ -883,7 +976,7 @@ def tool_get_history_processes(host: str, at: str, sort_by: str = "rss",
                   f"{'  [aggregated]' if aggregate else ''}")
         return header + "\n" + _format_procs_windows(procs, limit, aggregate)
     else:
-        ps_raw = parse_section(content, "ps_lnx") or ""
+        ps_raw = sections.get("ps_lnx") or ""
         if not ps_raw:
             return f"No ps_lnx section in snapshot for '{host}' at {ts}"
         procs = parse_processes_linux(ps_raw, filter_user, filter_cmd, compiled)
@@ -908,10 +1001,11 @@ def tool_get_history_section(host: str, at: str, section: str,
     if not snap:
         return f"No snapshot found for '{host}' around {at}"
     ts, content = snap
+    sections = parse_all_sections(content)
     names = SECTION_ALIASES.get(section, [section])
     parts = []
     for name in names:
-        raw = parse_section(content, name)
+        raw = sections.get(name)
         if raw:
             parts.append(f"<<<{name}>>>\n{raw}")
     if not parts:
@@ -1167,7 +1261,7 @@ try:
 except ImportError:
     raise SystemExit("Missing packages: pip install fastapi uvicorn")
 
-app = FastAPI(title="CheckMK Cache MCP", version="2.1.0", redirect_slashes=False)
+app = FastAPI(title="CheckMK Cache MCP", version="2.2.0", redirect_slashes=False)
 
 # Sessions: id → created timestamp (float). Cleaned up on each new initialize.
 _sessions: dict[str, float] = {}
@@ -1239,7 +1333,7 @@ async def mcp_endpoint(request: Request):
         _sessions[session_id] = datetime.now().timestamp()
         result = {
             "protocolVersion": "2024-11-05",
-            "serverInfo": {"name": "checkmk-cache", "version": "2.1.0"},
+            "serverInfo": {"name": "checkmk-cache", "version": "2.2.0"},
             "capabilities": {"tools": {}},
         }
     elif method == "ping":
@@ -1286,11 +1380,12 @@ async def health():
 
 if __name__ == "__main__":
     n_hist = len(_HISTORY_TOOLS) if HISTORY_DIR else 0
-    print("CheckMK Cache MCP  v2.1 (Windows+Linux)")
+    print("CheckMK Cache MCP  v2.2 (Windows+Linux)")
     print(f"  Cache:    {BASE_DIR}")
     print(f"  History:  {HISTORY_DIR or '(disabled — set CHECKMK_HISTORY_DIR to enable)'}")
     n_current = len(TOOLS) - (n_hist if HISTORY_DIR else 0)
     print(f"  Tools:    {len(TOOLS)} ({n_current} current{f' + {n_hist} historical' if HISTORY_DIR else ''})")
+    print(f"  MemCache: mtime-keyed{f', TTL={MEM_CACHE_TTL:.0f}s' if MEM_CACHE_TTL > 0 else ' (no TTL — set CHECKMK_MEM_CACHE_TTL to enable)'}")
     print(f"  Endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
     print(f"  Health:   http://{MCP_HOST}:{MCP_PORT}/health")
     print(f"  API-Key:  {'(set)' if API_KEY else '(none — set MCP_API_KEY to enable auth)'}")
