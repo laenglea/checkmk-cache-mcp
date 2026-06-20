@@ -4,11 +4,11 @@
 # Enable with:  systemctl enable --now checkmk-cache-collector@mysite
 #
 # The instance name (%i) must match the suffix of the EnvironmentFile:
-#   /etc/sysconfig/sync_checkmk_cache_%i
+#   /opt/checkmk-cache-mcp/etc/collector-%i.env
 
 [Unit]
 Description=CheckMK Cache Collector (%i)
-Documentation=https://github.com/yourorg/checkmk-cache-mcp
+Documentation=https://github.com/laenglea/checkmk-cache-mcp
 After=network.target
 
 # Restart automatically if inotifywait or the script exits unexpectedly
@@ -19,7 +19,7 @@ StartLimitBurst=5
 Type=simple
 
 # Load site-specific configuration
-EnvironmentFile=/etc/sysconfig/sync_checkmk_cache_%i
+EnvironmentFile=/opt/checkmk-cache-mcp/etc/collector-%i.env
 
 # Run as a dedicated non-root user (create with: useradd -r -s /sbin/nologin cmkcache)
 # The user needs read access to SOURCE_DIR and write access to DEST_DIR / LOCKDIR.
