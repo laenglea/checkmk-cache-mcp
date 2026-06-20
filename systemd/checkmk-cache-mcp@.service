@@ -1,11 +1,12 @@
-# /etc/systemd/system/checkmk-cache-mcp.service
+# /etc/systemd/system/checkmk-cache-mcp@.service
 #
 # MCP server — exposes CheckMK cache data via HTTP/SSE.
-# Enable with:  systemctl enable --now checkmk-cache-mcp
+# Instantiated service — one instance per CheckMK site.
+# Enable with:  systemctl enable --now checkmk-cache-mcp@mysite
 
 [Unit]
-Description=CheckMK Cache MCP Server
-Documentation=https://github.com/yourorg/checkmk-cache-mcp
+Description=CheckMK Cache MCP Server (%i)
+Documentation=https://github.com/laenglea/checkmk-cache-mcp
 After=network.target
 
 StartLimitIntervalSec=120
@@ -14,7 +15,7 @@ StartLimitBurst=5
 [Service]
 Type=simple
 
-EnvironmentFile=/etc/sysconfig/checkmk-cache-mcp
+EnvironmentFile=/opt/checkmk-cache-mcp/etc/%i.env
 
 User=cmkcache
 Group=cmkcache
@@ -30,11 +31,11 @@ RestartSec=10
 
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=checkmk-cache-mcp
+SyslogIdentifier=checkmk-cache-mcp-%i
 
 # Read-only access to cache and history directories
 # (adjust paths to match CHECKMK_CACHE_DIR / CHECKMK_HISTORY_DIR)
-ReadOnlyPaths=/omd /cachehistory
+ReadOnlyPaths=/opt/omd /cachehistory
 
 # Harden the service
 NoNewPrivileges=true
